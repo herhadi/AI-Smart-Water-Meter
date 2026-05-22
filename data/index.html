@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PDAM ROI SETTING</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: sans-serif; text-align: center; background: #f4f4f4; }
+        canvas { border: 2px solid #333; max-width: 100%; height: auto; background: #fff; cursor: crosshair; }
+        .btn { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h2>Kalibrasi Meteran PDAM</h2>
+    <p>Klik pada <b>Pojok Kiri Atas</b> angka pertama meteran</p>
+    <canvas id="canvas"></canvas>
+    <div style="margin-top: 10px;">
+        <span id="coords">X: 0, Y: 0</span><br><br>
+        <button class="btn" onclick="saveConfig()">Simpan ROI</button>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        img.src = '/capture?' + new Date().getTime(); // Anti-cache
+
+        img.onload = () => {
+            canvas.width = img.width;
+            canvas.height = img.height;
+            ctx.drawImage(img, 0, 0);
+        };
+
+        canvas.onclick = (e) => {
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const x = Math.round((e.clientX - rect.left) * scaleX);
+            const y = Math.round((e.clientY - rect.top) * scaleY);
+            
+            document.getElementById('coords').innerText = `X: ${x}, Y: ${y}`;
+            
+            // Re-draw image dan beri kotak penanda
+            ctx.drawImage(img, 0, 0);
+            ctx.strokeStyle = "red";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(x, y, 40, 60); // Estimasi satu digit
+            window.selectedX = x;
+            window.selectedY = y;
+        };
+
+        function saveConfig() {
+            if(!window.selectedX) return alert("Pilih titik dulu!");
+            fetch(`/save?x=${window.selectedX}&y=${window.selectedY}`)
+            .then(r => alert("ROI Disimpan!"));
+        }
+    </script>
+</body>
+</html>

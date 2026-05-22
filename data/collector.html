@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dataset Collector PDAM</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; }
+        #stream { width: 400px; border: 2px solid #333; }
+        .log { color: green; font-weight: bold; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h2>PDAM Dataset Collector</h2>
+    <img src="/capture" id="stream">
+    <p>Arahkan kamera ke angka meteran, lalu tekan tombol <b>0-9</b> di keyboard</p>
+    <div id="status" class="log">Siap mengambil data...</div>
+
+    <script>
+        document.addEventListener('keydown', function(event) {
+            if (event.key >= '0' && event.key <= '9') {
+                saveData(event.key);
+            }
+        });
+
+        function saveData(label) {
+            document.getElementById('status').innerText = "Menyimpan angka " + label + "...";
+            fetch('/collect?label=' + label)
+                .then(response => response.text())
+                .then(data => {
+                    document.getElementById('status').innerText = data;
+                    // Refresh gambar
+                    document.getElementById('stream').src = "/capture?t=" + new Date().getTime();
+                });
+        }
+    </script>
+</body>
+</html>
