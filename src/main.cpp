@@ -3,6 +3,7 @@
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include "esp_camera.h"
+#include "img_converters.h"
 #include "LittleFS.h"
 #include "esp_heap_caps.h"
 #include <memory>
@@ -51,11 +52,11 @@ bool initCamera()
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_VGA;
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.pixel_format = PIXFORMAT_RGB565;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
-  config.fb_count = 2;
+  config.fb_count = 1;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK)
@@ -65,6 +66,55 @@ bool initCamera()
   }
 
   Serial.println("Kamera Siap.");
+  return true;
+}
+
+bool captureJpeg(std::shared_ptr<uint8_t> &jpgBuf, size_t &jpgLen)
+{
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb)
+  {
+    Serial.println("esp_camera_fb_get gagal");
+    return false;
+  }
+
+  if (fb->format == PIXFORMAT_JPEG)
+  {
+    jpgLen = fb->len;
+    jpgBuf = std::shared_ptr<uint8_t>(
+      static_cast<uint8_t *>(heap_caps_malloc(jpgLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+      free
+    );
+
+    if (!jpgBuf)
+    {
+      esp_camera_fb_return(fb);
+      Serial.println("Alokasi buffer JPEG gagal");
+      return false;
+    }
+
+    memcpy(jpgBuf.get(), fb->buf, jpgLen);
+    esp_camera_fb_return(fb);
+    return true;
+  }
+
+  uint8_t *convertedBuf = nullptr;
+  size_t convertedLen = 0;
+  bool converted = frame2jpg(fb, 80, &convertedBuf, &convertedLen);
+  esp_camera_fb_return(fb);
+
+  if (!converted || convertedBuf == nullptr || convertedLen == 0)
+  {
+    if (convertedBuf)
+    {
+      free(convertedBuf);
+    }
+    Serial.println("Konversi frame ke JPEG gagal");
+    return false;
+  }
+
+  jpgBuf = std::shared_ptr<uint8_t>(convertedBuf, free);
+  jpgLen = convertedLen;
   return true;
 }
 
@@ -215,8 +265,9 @@ void setup()
       return;
     }
 
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb)
+    std::shared_ptr<uint8_t> jpgBuf;
+    size_t jpgLen = 0;
+    if (!captureJpeg(jpgBuf, jpgLen))
     {
       request->send(500, "text/plain", "Camera Capture Failed");
       return;
@@ -226,7 +277,7 @@ void setup()
     File file = LittleFS.open(path, FILE_WRITE);
     if (file)
     {
-      file.write(fb->buf, fb->len);
+      file.write(jpgBuf.get(), jpgLen);
       file.close();
       Serial.printf("Dataset tersimpan: %s\n", path.c_str());
       request->send(200, "text/plain", "Berhasil simpan ke kelas: " + label);
@@ -235,8 +286,6 @@ void setup()
     {
       request->send(500, "text/plain", "Gagal simpan file");
     }
-
-    esp_camera_fb_return(fb);
   });
 
   server.on("/list", HTTP_GET, [](AsyncWebServerRequest *request)
@@ -269,35 +318,13 @@ void setup()
 
   server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request)
             {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb)
+    std::shared_ptr<uint8_t> jpgBuf;
+    size_t jpgLen = 0;
+    if (!captureJpeg(jpgBuf, jpgLen))
     {
       request->send(500, "text/plain", "Gagal Capture");
       return;
     }
-
-    if (fb->format != PIXFORMAT_JPEG)
-    {
-      esp_camera_fb_return(fb);
-      request->send(500, "text/plain", "Camera frame is not JPEG");
-      return;
-    }
-
-    size_t jpgLen = fb->len;
-    std::shared_ptr<uint8_t> jpgBuf(
-      static_cast<uint8_t *>(heap_caps_malloc(jpgLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
-      free
-    );
-
-    if (!jpgBuf)
-    {
-      esp_camera_fb_return(fb);
-      request->send(500, "text/plain", "Gagal alokasi buffer JPEG");
-      return;
-    }
-
-    memcpy(jpgBuf.get(), fb->buf, jpgLen);
-    esp_camera_fb_return(fb);
 
     request->send("image/jpeg", jpgLen, [jpgBuf, jpgLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
       size_t remaining = jpgLen - index;
