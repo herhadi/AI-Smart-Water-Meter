@@ -4,7 +4,8 @@
 #include <AsyncTCP.h>
 #include "esp_camera.h"
 #include "LittleFS.h"
-#include "img_converters.h" // Untuk konversi format gambar
+#include "esp_heap_caps.h"
+#include <memory>
 
 // Pinout Kamera untuk ESP32-S3 (Sesuaikan jika board Anda beda, ini umum untuk S3-Sense)
 #define PWDN_GPIO_NUM -1
@@ -25,8 +26,9 @@
 #define PCLK_GPIO_NUM 13
 
 AsyncWebServer server(80);
+bool fsReady = false;
 
-void initCamera()
+bool initCamera()
 {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -51,122 +53,270 @@ void initCamera()
   config.frame_size = FRAMESIZE_VGA;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = CAMERA_FB_IN_PSRAM; // WAJIB UNTUK S3 N16R8
+  config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
   config.fb_count = 2;
 
-  if (esp_camera_init(&config) != ESP_OK)
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK)
   {
-    Serial.println("Kamera Gagal!");
+    Serial.printf("Kamera Gagal! esp_camera_init error=0x%08x\n", err);
+    return false;
+  }
+
+  Serial.println("Kamera Siap.");
+  return true;
+}
+
+bool ensureDir(fs::FS &fs, const char *path)
+{
+  if (fs.exists(path))
+  {
+    return true;
+  }
+  return fs.mkdir(path);
+}
+
+void sendRequiredFile(AsyncWebServerRequest *request, const char *path, const char *contentType)
+{
+  if (!fsReady)
+  {
+    request->send(500, "text/plain", "LittleFS is not mounted");
     return;
   }
-  Serial.println("Kamera Siap.");
+
+  if (!LittleFS.exists(path))
+  {
+    request->send(500, "text/plain", String("Required file missing in LittleFS: ") + path);
+    return;
+  }
+
+  request->send(LittleFS, path, contentType);
 }
 
 void setup()
 {
-  Serial.begin(115200);
-  if (!LittleFS.begin(true))
+  Serial.begin(921600);
+  Serial.println("--- boot ---");
+
+  fsReady = LittleFS.begin(false);
+  if (!fsReady)
   {
-    Serial.println("LittleFS Error!");
-    return;
+    Serial.println("LittleFS mount failed. Upload the filesystem image before using web/storage.");
+  }
+  else
+  {
+    Serial.println("LittleFS mounted.");
   }
 
-  // Buat folder utama dan sub-folder 0-9
-  if (!LittleFS.exists("/train"))
-    LittleFS.mkdir("/train");
-
-  for (int i = 0; i <= 9; i++)
+  if (fsReady)
   {
-    String path = "/train/" + String(i);
-    if (!LittleFS.exists(path))
+    Serial.println("Listing LittleFS root:");
+    File root = LittleFS.open("/");
+    if (root)
     {
-      LittleFS.mkdir(path);
-      Serial.printf("Folder %s berhasil dibuat\n", path.c_str());
+      File file = root.openNextFile();
+      while (file)
+      {
+        Serial.printf(" - %s (len=%u)\n", file.name(), file.size());
+        file = root.openNextFile();
+      }
+    }
+    else
+    {
+      Serial.println("Failed to open LittleFS root");
+    }
+
+    ensureDir(LittleFS, "/train");
+    for (int i = 0; i <= 9; i++)
+    {
+      String path = "/train/" + String(i);
+      if (ensureDir(LittleFS, path.c_str()))
+      {
+        Serial.printf("Folder %s siap\n", path.c_str());
+      }
     }
   }
+  else
+  {
+    Serial.println("Skipping LittleFS listing and storage directory creation.");
+  }
 
-  initCamera();
+  if (!initCamera())
+  {
+    Serial.println("Inisialisasi kamera gagal, endpoint kamera akan mengembalikan error.");
+  }
 
-  // WiFi Setup (Ganti dengan SSID Anda)
-  WiFi.begin("Sendang Kamulyan", "");
+  Serial.println("Connecting to WiFi SSID: AP_HOME1");
+  WiFi.begin("wifilogger", "protectLogger");
   while (WiFi.status() != WL_CONNECTED)
   {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nIP Address: " + WiFi.localIP().toString());
+  Serial.println("\nWiFi connected. IP Address: " + WiFi.localIP().toString());
+
+  Serial.println("Registering HTTP endpoints...");
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request)
-            { request->send(LittleFS, "/index.html", "text/html"); });
+            { sendRequiredFile(request, "/index.html", "text/html"); });
+
+  server.on("/collector", HTTP_GET, [](AsyncWebServerRequest *request)
+            { sendRequiredFile(request, "/collector.html", "text/html"); });
 
   server.on("/save", HTTP_GET, [](AsyncWebServerRequest *request)
             {
-    if (request->hasParam("x") && request->hasParam("y")) {
-        String x = request->getParam("x")->value();
-        String y = request->getParam("y")->value();
-        
-        File f = LittleFS.open("/config.ini", "w");
-        f.printf("[ROI]\nx=%s\ny=%s\n", x.c_str(), y.c_str());
-        f.close();
-        
-        Serial.printf("ROI Disimpan: X=%s, Y=%s\n", x.c_str(), y.c_str());
-        request->send(200, "text/plain", "Saved");
-    } });
+    if (!request->hasParam("x") || !request->hasParam("y"))
+    {
+      request->send(400, "text/plain", "Missing x or y");
+      return;
+    }
+
+    String x = request->getParam("x")->value();
+    String y = request->getParam("y")->value();
+    if (!fsReady)
+    {
+      request->send(500, "text/plain", "LittleFS is not mounted");
+      return;
+    }
+
+    File f = LittleFS.open("/config.ini", "w");
+    if (!f)
+    {
+      request->send(500, "text/plain", "Failed to open /config.ini");
+      return;
+    }
+
+    f.printf("[ROI]\nx=%s\ny=%s\n", x.c_str(), y.c_str());
+    f.close();
+
+    Serial.printf("ROI Disimpan: X=%s, Y=%s\n", x.c_str(), y.c_str());
+    request->send(200, "text/plain", "Saved");
+  });
 
   server.on("/collect", HTTP_GET, [](AsyncWebServerRequest *request)
             {
-    if (request->hasParam("label")) {
-        String label = request->getParam("label")->value();
-        
-        camera_fb_t * fb = esp_camera_fb_get();
-        if (!fb) return request->send(500, "text/plain", "Camera Capture Failed");
+    if (!request->hasParam("label"))
+    {
+      request->send(400, "text/plain", "Missing label");
+      return;
+    }
 
-        // Tentukan path penyimpanan (Gunakan millis agar nama file unik)
-        String path = "/train/" + label + "/" + String(millis()) + ".jpg";
-        
-        // Buat folder jika belum ada (Opsional, tergantung versi LittleFS)
-        // LittleFS.mkdir("/train/" + label); 
+    String label = request->getParam("label")->value();
+    if (label.length() != 1 || label[0] < '0' || label[0] > '9')
+    {
+      request->send(400, "text/plain", "Label must be 0-9");
+      return;
+    }
 
-        File file = LittleFS.open(path, FILE_WRITE);
-        if (file) {
-            // Simpan seluruh frame atau hasil crop? 
-            // Untuk training, lebih baik simpan hasil crop 32x20 pixel
-            // Tapi untuk awal, kita simpan full frame agar bisa kita crop di Mac
-            file.write(fb->buf, fb->len);
-            file.close();
-            Serial.printf("Dataset tersimpan: %s\n", path.c_str());
-            request->send(200, "text/plain", "Berhasil simpan ke kelas: " + label);
-        } else {
-            request->send(500, "text/plain", "Gagal simpan file");
-        }
-        
-        esp_camera_fb_return(fb);
-    } });
+    if (!fsReady)
+    {
+      request->send(500, "text/plain", "LittleFS is not mounted");
+      return;
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb)
+    {
+      request->send(500, "text/plain", "Camera Capture Failed");
+      return;
+    }
+
+    String path = "/train/" + label + "/" + String(millis()) + ".jpg";
+    File file = LittleFS.open(path, FILE_WRITE);
+    if (file)
+    {
+      file.write(fb->buf, fb->len);
+      file.close();
+      Serial.printf("Dataset tersimpan: %s\n", path.c_str());
+      request->send(200, "text/plain", "Berhasil simpan ke kelas: " + label);
+    }
+    else
+    {
+      request->send(500, "text/plain", "Gagal simpan file");
+    }
+
+    esp_camera_fb_return(fb);
+  });
 
   server.on("/list", HTTP_GET, [](AsyncWebServerRequest *request)
             {
-    String output = "Daftar Dataset:\n";
-    for (int i = 0; i <= 9; i++) {
-        String path = "/train/" + String(i);
-        File root = LittleFS.open(path);
-        File file = root.openNextFile();
-        int count = 0;
-        while(file) { count++; file = root.openNextFile(); }
-        output += "Kelas " + String(i) + ": " + String(count) + " foto\n";
+    if (!fsReady)
+    {
+      request->send(500, "text/plain", "LittleFS is not mounted");
+      return;
     }
-    request->send(200, "text/plain", output); });
 
-  // Endpoint untuk ambil foto ke Browser
+    String output = "Daftar Dataset:\n";
+    for (int i = 0; i <= 9; i++)
+    {
+      String path = "/train/" + String(i);
+      File root = LittleFS.open(path);
+      int count = 0;
+      if (root)
+      {
+        File file = root.openNextFile();
+        while (file)
+        {
+          count++;
+          file = root.openNextFile();
+        }
+      }
+      output += "Kelas " + String(i) + ": " + String(count) + " foto\n";
+    }
+    request->send(200, "text/plain", output);
+  });
+
   server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request)
             {
-        camera_fb_t * fb = esp_camera_fb_get();
-        if (!fb) return request->send(500, "text/plain", "Gagal Capture");
-        AsyncWebServerResponse *response = request->beginResponse(200, "image/jpeg", fb->buf, fb->len);
-        request->send(response);
-        esp_camera_fb_return(fb); });
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb)
+    {
+      request->send(500, "text/plain", "Gagal Capture");
+      return;
+    }
+
+    if (fb->format != PIXFORMAT_JPEG)
+    {
+      esp_camera_fb_return(fb);
+      request->send(500, "text/plain", "Camera frame is not JPEG");
+      return;
+    }
+
+    size_t jpgLen = fb->len;
+    std::shared_ptr<uint8_t> jpgBuf(
+      static_cast<uint8_t *>(heap_caps_malloc(jpgLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
+      free
+    );
+
+    if (!jpgBuf)
+    {
+      esp_camera_fb_return(fb);
+      request->send(500, "text/plain", "Gagal alokasi buffer JPEG");
+      return;
+    }
+
+    memcpy(jpgBuf.get(), fb->buf, jpgLen);
+    esp_camera_fb_return(fb);
+
+    request->send("image/jpeg", jpgLen, [jpgBuf, jpgLen](uint8_t *buffer, size_t maxLen, size_t index) -> size_t {
+      size_t remaining = jpgLen - index;
+      size_t bytesToCopy = remaining < maxLen ? remaining : maxLen;
+      memcpy(buffer, jpgBuf.get() + index, bytesToCopy);
+      return bytesToCopy;
+    });
+  });
+
+  server.serveStatic("/", LittleFS, "/");
+
+  server.onNotFound([](AsyncWebServerRequest *request)
+                    {
+    Serial.printf("HTTP Request: method=%d url=%s\n", request->method(), request->url().c_str());
+    request->send(404, "text/plain", "Not Found");
+  });
 
   server.begin();
+  Serial.println("HTTP server started.");
 }
 
 void loop() {}

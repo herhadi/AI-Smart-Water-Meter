@@ -10,7 +10,7 @@
 </head>
 <body>
     <h2>PDAM Dataset Collector</h2>
-    <img src="/capture" id="stream">
+    <img id="stream">
     <p>Arahkan kamera ke angka meteran, lalu tekan tombol <b>0-9</b> di keyboard</p>
     <div id="status" class="log">Siap mengambil data...</div>
 
@@ -21,14 +21,25 @@
             }
         });
 
+        const stream = document.getElementById('stream');
+
+        function refreshStream() {
+            stream.src = "/capture?t=" + new Date().getTime();
+        }
+
+        stream.onerror = () => {
+            setTimeout(refreshStream, 1000);
+        };
+
+        refreshStream();
+
         function saveData(label) {
             document.getElementById('status').innerText = "Menyimpan angka " + label + "...";
             fetch('/collect?label=' + label)
                 .then(response => response.text())
                 .then(data => {
                     document.getElementById('status').innerText = data;
-                    // Refresh gambar
-                    document.getElementById('stream').src = "/capture?t=" + new Date().getTime();
+                    refreshStream();
                 });
         }
     </script>
