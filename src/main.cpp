@@ -26,8 +26,13 @@
 #define HREF_GPIO_NUM 7
 #define PCLK_GPIO_NUM 13
 
+#define CAMERA_FRAME_SIZE FRAMESIZE_VGA
+
 AsyncWebServer server(80);
 bool fsReady = false;
+
+uint8_t* globalJpgBuf = nullptr;
+size_t globalJpgSubSize = 0;
 
 bool initCamera()
 {
@@ -51,21 +56,21 @@ bool initCamera()
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_VGA;
-  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = CAMERA_FRAME_SIZE;
+  
+  // Gunakan kembali format yang didukung sensor Anda
+  config.pixel_format = PIXFORMAT_RGB565; 
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
+  config.fb_count = 1; // 1 buffer cukup untuk mode RAW agar hemat memori
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK)
   {
-    Serial.printf("Kamera Gagal! esp_camera_init error=0x%08x\n", err);
+    Serial.printf("Kamera Gagal! error=0x%08x\n", err);
     return false;
   }
-
-  Serial.println("Kamera Siap.");
+  Serial.println("Kamera Siap dengan mode RGB565.");
   return true;
 }
 
@@ -78,41 +83,22 @@ bool captureJpeg(std::shared_ptr<uint8_t> &jpgBuf, size_t &jpgLen)
     return false;
   }
 
-  if (fb->format == PIXFORMAT_JPEG)
-  {
-    jpgLen = fb->len;
-    jpgBuf = std::shared_ptr<uint8_t>(
-      static_cast<uint8_t *>(heap_caps_malloc(jpgLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)),
-      free
-    );
-
-    if (!jpgBuf)
-    {
-      esp_camera_fb_return(fb);
-      Serial.println("Alokasi buffer JPEG gagal");
-      return false;
-    }
-
-    memcpy(jpgBuf.get(), fb->buf, jpgLen);
-    esp_camera_fb_return(fb);
-    return true;
-  }
-
+  // Bersihkan buffer lama jika ada konversi software sebelumnya
   uint8_t *convertedBuf = nullptr;
   size_t convertedLen = 0;
+  
+  // Lakukan konversi software dari RGB565 ke JPEG dengan kualitas 80
   bool converted = frame2jpg(fb, 80, &convertedBuf, &convertedLen);
   esp_camera_fb_return(fb);
 
   if (!converted || convertedBuf == nullptr || convertedLen == 0)
   {
-    if (convertedBuf)
-    {
-      free(convertedBuf);
-    }
+    if (convertedBuf) free(convertedBuf);
     Serial.println("Konversi frame ke JPEG gagal");
     return false;
   }
 
+  // Gunakan shared_ptr untuk membebaskan convertedBuf secara otomatis setelah dikirim
   jpgBuf = std::shared_ptr<uint8_t>(convertedBuf, free);
   jpgLen = convertedLen;
   return true;
@@ -146,7 +132,7 @@ void sendRequiredFile(AsyncWebServerRequest *request, const char *path, const ch
 
 void setup()
 {
-  Serial.begin(921600);
+  Serial.begin(115200);
   Serial.println("--- boot ---");
 
   fsReady = LittleFS.begin(false);
@@ -195,8 +181,11 @@ void setup()
   if (!initCamera())
   {
     Serial.println("Inisialisasi kamera gagal, endpoint kamera akan mengembalikan error.");
+  } else
+  {
+    Serial.println("Kamera berhasil diinisialisasi.");
   }
-
+  delay(1000);
   Serial.println("Connecting to WiFi SSID: AP_HOME1");
   WiFi.begin("wifilogger", "protectLogger");
   while (WiFi.status() != WL_CONNECTED)
@@ -317,7 +306,11 @@ void setup()
   });
 
   server.on("/capture", HTTP_GET, [](AsyncWebServerRequest *request)
-            {
+{
+    // Tambahkan delay microsecond atau biarkan yield dijalankan 
+    // agar core ESP32 sempat memproses task background WiFi
+    vTaskDelay(10 / portTICK_PERIOD_MS); 
+
     std::shared_ptr<uint8_t> jpgBuf;
     size_t jpgLen = 0;
     if (!captureJpeg(jpgBuf, jpgLen))
@@ -332,7 +325,7 @@ void setup()
       memcpy(buffer, jpgBuf.get() + index, bytesToCopy);
       return bytesToCopy;
     });
-  });
+});
 
   server.serveStatic("/", LittleFS, "/");
 
